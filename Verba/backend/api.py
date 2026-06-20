@@ -346,17 +346,30 @@ def transcribe_upload():
         return jsonify({'error': 'No selected file'}), 400
 
     try:
-        # Get file extension
+        # Save the uploaded file with its original extension first
         filename = file.filename.lower()
-        if filename.endswith(('.mp3', '.m4a', '.aac', '.ogg', '.wma')):
-            suffix = '.mp3'
-        elif filename.endswith(('.wav')):
-            suffix = '.wav'
-        else:
-            suffix = '.mp3'  # Default to mp3 for unknown formats
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
+        orig_suffix = os.path.splitext(filename)[1] or '.bin'
+        with tempfile.NamedTemporaryFile(delete=False, suffix=orig_suffix) as tmp_orig:
+            file.save(tmp_orig.name)
+            orig_path = tmp_orig.name
+
+        # Convert to a real WAV file using pydub/ffmpeg, regardless of input format
+        # (browsers/devices send mp3, ogg/opus, m4a, aac, wma, webm, etc. — pydub
+        # auto-detects the real format from file content via ffmpeg, not extension)
+        try:
+            audio_seg = AudioSegment.from_file(orig_path)
+            tmp_path = orig_path + '_converted.wav'
+            audio_seg.export(tmp_path, format='wav')
+        except Exception as conv_err:
+            print(f"Audio conversion failed: {conv_err}")
+            return jsonify({'error': 'Could not process audio file. Please upload a valid audio file (mp3, wav, ogg, m4a, etc.).'}), 400
+        finally:
+            # Clean up the original upload now that we have the converted version
+            try:
+                os.remove(orig_path)
+            except OSError:
+                pass
+
         print(f"Processing audio file: {file.filename} -> {tmp_path}")
         # --- Advanced Audio Metrics ---
         pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
