@@ -5,11 +5,11 @@ from flask_sqlalchemy import SQLAlchemy
 import whisper
 import nltk
 import os
+import gc
 import tempfile
 from flask_bcrypt import Bcrypt
 from datetime import datetime
 import numpy as np
-import librosa
 from scipy.ndimage import median_filter
 from pydub import AudioSegment
 import requests
@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 nltk.download('punkt', quiet=True)
 nltk.download('wordnet', quiet=True)
 nltk.download('omw-1.4', quiet=True)
+nltk.download('words', quiet=True)
 
 load_dotenv()
 
@@ -87,6 +88,10 @@ except Exception as e:
     print(f"Error during db.create_all(): {e}")
 
 model = whisper.load_model("tiny")  # Load once at startup
+
+# Cache the common-words set once at startup instead of rebuilding it
+# (and re-slicing 235k+ words) on every single upload request.
+COMMON_WORDS_SET = set(nltk.corpus.words.words()[:2000])
 
 def get_float(segment, key):
     value = segment.get(key, 0)
@@ -470,12 +475,26 @@ def transcribe_upload():
             pitch_variation_percent = None
             pitch_mean_hz = None
             pitch_label = "Pitch not detected"
+        # Free parselmouth/numpy memory before the heavier Whisper transcription step
+        try:
+            del snd, x
+        except NameError:
+            pass
+        gc.collect()
+
         # --- Whisper Transcription ---
-        result = model.transcribe(tmp_path)
+        result = model.transcribe(tmp_path, fp16=False)
         transcript = result['text']
         if isinstance(transcript, list):
             transcript = " ".join(transcript)
         segments = result['segments']
+        del result
+        # Clean up the temp WAV file now — nothing downstream needs the audio anymore
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        gc.collect()
         filler_words = ["um", "uh", "like", "you know"]
         words = nltk.word_tokenize(transcript.lower())
         total_words = len(words)
@@ -491,7 +510,7 @@ def transcribe_upload():
         try:
             unique_words = set(words)
             vocab_richness = len(unique_words) / total_words if total_words > 0 else None
-            common_words = set(nltk.corpus.words.words()[:2000])
+            common_words = COMMON_WORDS_SET
             advanced_words = [w for w in unique_words if w.isalpha() and w not in common_words]
             advanced_vocab_count = len(advanced_words)
             sentences = nltk.sent_tokenize(transcript)
@@ -581,10 +600,6 @@ def transcribe_upload():
         )
         db.session.add(upload)
         db.session.commit()
-        try:
-            os.unlink(tmp_path)
-        except:
-            pass
         if pitch_mean_hz is not None and pitch_mean_hz > 0:
             pitch_explanation = f"{pitch_mean_hz} Hz — {pitch_label}"
         else:
