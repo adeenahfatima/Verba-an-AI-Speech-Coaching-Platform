@@ -10,13 +10,12 @@ psycopg2-binary==2.9.9
 alembic==1.13.1
 
 # --- Speech-to-text ---
+--extra-index-url https://download.pytorch.org/whl/cpu
 openai-whisper==20250625
-torch==2.4.1
+torch==2.4.1+cpu
 
 # --- Audio processing & analysis ---
-librosa==0.10.1
 pydub==0.25.1
-pyAudioAnalysis
 praat-parselmouth
 numpy==1.24.4
 scipy
@@ -25,6 +24,5 @@ scipy
 nltk==3.9.1
 
 # --- Utilities ---
-matplotlib
 python-dotenv
 requests
