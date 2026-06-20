@@ -74,43 +74,75 @@
       window.location.href = 'login.html';
     };
 
-    function showProcessingAlert() {
+    function renderProgressBar(percent, statusText) {
       document.getElementById('upload-result').innerHTML = `
         <div style="text-align: center; padding: 24px; background: #fffbe0; border-radius: 24px; border: 2px solid #ffcc00; box-shadow: 0 4px 16px rgba(0,0,0,0.10);">
-          <div style="font-size: 1.3rem; font-weight: bold; color: #181818; margin-bottom: 14px; display: flex; flex-direction: column; align-items: center;">
-            <span style="margin-bottom: 10px;">
-              <svg width='40' height='40' viewBox='0 0 40 40' fill='none' style='animation: spin 1s linear infinite;'><circle cx='20' cy='20' r='18' stroke='#ffcc00' stroke-width='4' stroke-dasharray='90 60'/></svg>
-            </span>
-            Processing Your Audio...
+          <div style="font-size: 1.2rem; font-weight: bold; color: #181818; margin-bottom: 14px;">
+            ${statusText}
           </div>
-          <div style="color: #666;">Please wait while we analyze your speech. This may take a few moments.</div>
+          <div style="width: 100%; background: #f0e6c0; border-radius: 12px; overflow: hidden; height: 22px; border: 1px solid #ffcc00;">
+            <div style="width: ${percent}%; background: #ffcc00; height: 100%; transition: width 0.4s ease; display:flex; align-items:center; justify-content:center; font-weight:bold; color:#181818; font-size:0.85rem;">
+              ${percent}%
+            </div>
+          </div>
         </div>
-        <style>@keyframes spin { 100% { transform: rotate(360deg); } }</style>
       `;
     }
 
-    async function uploadWithRetry(formData, retries = 1, timeout = 180000) {
-      let lastError;
-      for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeout);
-          const response = await fetch(`/api/transcribe_upload`, {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal
-          });
-          clearTimeout(timer);
-          if (!response.ok) throw new Error('Server error: ' + response.status);
-          return await response.json();
-        } catch (err) {
-          lastError = err;
-          if (attempt < retries) {
-            showProcessingAlert();
-          }
-        }
+    const STATUS_LABELS = {
+      queued: "Queued...",
+      converting: "Preparing audio file...",
+      analyzing_pitch: "Analyzing pitch and tone...",
+      transcribing: "Transcribing speech (this is the slow part)...",
+      scoring: "Analyzing vocabulary and pacing...",
+      generating_tips: "Generating your feedback...",
+      done: "Done!"
+    };
+
+    function pollJobStatus(jobId) {
+      return new Promise((resolve, reject) => {
+        const poll = () => {
+          fetch(`/api/job_status/${jobId}`)
+            .then(res => {
+              if (!res.ok) throw new Error('Status check failed: ' + res.status);
+              return res.json();
+            })
+            .then(job => {
+              if (job.status === 'error') {
+                reject(new Error(job.error || 'Processing failed'));
+                return;
+              }
+              const label = STATUS_LABELS[job.status] || 'Processing...';
+              renderProgressBar(job.percent ?? 0, label);
+              if (job.status === 'done') {
+                resolve(job.result);
+              } else {
+                setTimeout(poll, 1500);
+              }
+            })
+            .catch(reject);
+        };
+        poll();
+      });
+    }
+
+    async function startUpload(formData) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30000); // only covers the initial upload, not processing
+      let response;
+      try {
+        response = await fetch(`/api/transcribe_upload`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timer);
       }
-      throw lastError;
+      if (!response.ok) throw new Error('Server error: ' + response.status);
+      const data = await response.json();
+      if (!data.job_id) throw new Error('No job ID returned from server');
+      return pollJobStatus(data.job_id);
     }
 
     document.getElementById('upload-form').addEventListener('submit', function(e) {
@@ -123,7 +155,7 @@
       }
       formData.append('audio-upload', fileInput.files[0]);
       formData.append('user_id', user.id);
-      showProcessingAlert();
+      renderProgressBar(0, 'Starting upload...');
       // First check if model is ready
       fetch('/api/status')
         .then(response => response.json())
@@ -139,8 +171,8 @@
             `;
             return;
           }
-          // Model is ready, proceed with upload (with retry)
-          return uploadWithRetry(formData, 1, 180000);
+          // Model is ready, proceed with upload + progress polling
+          return startUpload(formData);
         })
         .then(data => {
           if (!data) return;
