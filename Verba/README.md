@@ -8,13 +8,20 @@ OpenAI Whisper and runs acoustic analysis with librosa and Praat (parselmouth).
 
 ## Tech Stack
 
-Backend:              Flask, Flask-SQLAlchemy, Gunicorn 
+ Backend:              Flask, Flask-SQLAlchemy, Gunicorn 
+ 
  Database:           PostgreSQL (production) / SQLite (local dev fallback) 
+ 
  Migrations:         Alembic 
+ 
  Speech-to-text:     OpenAI Whisper 
+ 
  Audio analysis:     librosa, parselmouth (Praat), pyAudioAnalysis 
+ 
  NLP:                NLTK 
+ 
  Frontend:           Plain HTML/CSS/JS (no build step, served directly by Flask) 
+ 
  Auth:               Flask-Bcrypt (password hashing) 
 
 ---
