@@ -62,15 +62,21 @@ Verba-prod/
 Create a `.env` file locally based on `.env.example`:
 
 ```env
+
 SECRET_KEY=your-random-secret-key
+
 DATABASE_URL=postgresql://user:password@host:5432/verba
+
 HF_API_KEY=                    # optional — enables AI-generated tips, leave blank to disable
 ```
 
 Variables:
 `SECRET_KEY`:     Used for Flask session signing 
+
 `DATABASE_URL`:   Falls back to local SQLite if unset 
+
 `HF_API_KEY`:     If unset, AI tips section is skipped gracefully (`ai_advice: null`) 
+
 `PORT`:           Auto-set by host. Defaults to `5000` locally
 
 ---
@@ -178,13 +184,16 @@ curl -X POST http://localhost:5000/api/transcribe_upload \
 ## Deployment
 
 This app is configured for **Railway** (or any host supporting a `Procfile`).
+
 Check it out: verbaprod-production.up.railway.app
 
 
 ## Local-only Helper Scripts
 
 `scripts/serve_frontend_local.py`:  Serves only the `frontend/` folder standalone (useful if testing frontend without running the full Flask backend) 
+
 `scripts/migrate_uploads.py`:       One-off script for migrating old upload records to a new schema 
+
 `scripts/test_hf_api.py`:           Manually test a HuggingFace inference endpoint outside the app 
 
 
