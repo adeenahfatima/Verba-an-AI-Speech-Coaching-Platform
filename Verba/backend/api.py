@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 # Download NLTK data only if not already present
 nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab', quiet=True)
 nltk.download('wordnet', quiet=True)
 nltk.download('omw-1.4', quiet=True)
 nltk.download('words', quiet=True)
