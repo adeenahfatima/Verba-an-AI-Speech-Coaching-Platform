@@ -1,0 +1,30 @@
+# --- Web framework ---
+flask==2.3.3
+flask-cors==4.0.0
+flask-sqlalchemy==3.1.1
+flask-bcrypt==1.0.1
+gunicorn==21.2.0
+
+# --- Database ---
+psycopg2-binary==2.9.9
+alembic==1.13.1
+
+# --- Speech-to-text ---
+openai-whisper==20250625
+torch==2.4.1
+
+# --- Audio processing & analysis ---
+librosa==0.10.1
+pydub==0.25.1
+pyAudioAnalysis
+praat-parselmouth
+numpy==1.24.4
+scipy
+
+# --- NLP ---
+nltk==3.9.1
+
+# --- Utilities ---
+matplotlib
+python-dotenv
+requests

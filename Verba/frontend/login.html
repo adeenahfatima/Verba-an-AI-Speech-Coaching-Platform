@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login - Verba</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <img src="logo.png" alt="Verba Logo" class="logo">
+      <span class="brand">Verba</span>
+    </div>
+    <div class="header-right">
+      <a href="register.html" class="btn btn-register-green">Register</a>
+    </div>
+  </header>
+  <main class="main-content">
+    <form id="login-form" class="auth-form">
+      <h2>Sign In</h2>
+      <label for="username-email">Username or Email</label>
+      <input type="text" id="username-email" name="username-email" required>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+      <button type="submit" class="btn btn-primary">Login</button>
+      <div id="login-result" style="margin-top:16px;"></div>
+      <div class="form-link">Don't have an account? <a href="register.html">Register</a></div>
+    </form>
+  </main>
+  <footer class="footer">
+    <div class="footer-left">
+      <div class="footer-brand-row">
+        <img src="logo.png" alt="Verba Logo" class="footer-logo">
+        <span>Verba</span>
+      </div>
+      <div class="footer-desc">Your personal AI companion for confident communication.</div>
+      <div class="footer-copy">&copy; Copyright 2024. All rights reserved.</div>
+      <div class="footer-copy">&copy; Made with ❤️ by Adina Fatima.</div>
+    </div>
+    <div class="footer-links">
+      <div>
+        <strong>Customer Service</strong>
+        <ul>
+          <li>Contact Us</li>
+          <li>Privacy Policy</li>
+          <li>Terms and Conditions</li>
+        </ul>
+      </div>
+      <div>
+        <strong>Use Cases</strong>
+        <ul>
+          <li>Class Presentations</li>
+          <li>Interviews</li>
+          <li>Debates</li>
+          <li>Speech Practice</li>
+          <li>Personal Confidence</li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const usernameOrEmail = document.getElementById('username-email').value.trim();
+      const password = document.getElementById('password').value;
+      const resultDiv = document.getElementById('login-result');
+      resultDiv.innerHTML = '';
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: usernameOrEmail, password })
+        });
+        const data = await response.json();
+        if (response.ok) {
+          // Store user info in localStorage
+          localStorage.setItem('verbaUser', JSON.stringify(data.user));
+          resultDiv.innerHTML = '<span style="color:green;">Login successful! Redirecting...</span>';
+          setTimeout(() => {
+            window.location.href = 'dashboard.html';
+          }, 1000);
+        } else {
+          resultDiv.innerHTML = `<span style="color:#b00020;">${data.error || 'Login failed.'}</span>`;
+        }
+      } catch (err) {
+        resultDiv.innerHTML = `<span style="color:#b00020;">Error: ${err.message}</span>`;
+      }
+    });
+  </script>
+</body>
+</html>

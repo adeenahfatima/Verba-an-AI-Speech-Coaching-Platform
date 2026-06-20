@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Register - Verba</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <img src="logo.png" alt="Verba Logo" class="logo">
+      <span class="brand">Verba</span>
+    </div>
+    <div class="header-right">
+      <a href="login.html" class="btn btn-signin">Sign in</a>
+    </div>
+  </header>
+  <main class="main-content">
+    <form id="register-form" class="auth-form">
+      <h2>Create Account</h2>
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required>
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" required>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+      <label for="confirm-password">Confirm Password</label>
+      <input type="password" id="confirm-password" name="confirm-password" required>
+      <button type="submit" class="btn btn-primary">Register</button>
+      <div id="register-result" style="margin-top:16px;"></div>
+      <div class="form-link">Already have an account? <a href="login.html">Sign in</a></div>
+    </form>
+  </main>
+  <footer class="footer">
+    <div class="footer-left">
+      <div class="footer-brand-row">
+        <img src="logo.png" alt="Verba Logo" class="footer-logo">
+        <span>Verba</span>
+      </div>
+      <div class="footer-desc">Your personal AI companion for confident communication.</div>
+      <div class="footer-copy">&copy; Copyright 2024. All rights reserved.</div>
+      <div class="footer-copy">&copy; Made with ❤️ by Adina Fatima.</div>
+    </div>
+    <div class="footer-links">
+      <div>
+        <strong>Customer Service</strong>
+        <ul>
+          <li>Contact Us</li>
+          <li>Privacy Policy</li>
+          <li>Terms and Conditions</li>
+        </ul>
+      </div>
+      <div>
+        <strong>Use Cases</strong>
+        <ul>
+          <li>Class Presentations</li>
+          <li>Interviews</li>
+          <li>Debates</li>
+          <li>Speech Practice</li>
+          <li>Personal Confidence</li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+  <script>
+    document.getElementById('register-form').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      const username = document.getElementById('username').value.trim();
+      const email = document.getElementById('email').value.trim();
+      const password = document.getElementById('password').value;
+      const confirmPassword = document.getElementById('confirm-password').value;
+      const resultDiv = document.getElementById('register-result');
+      resultDiv.innerHTML = '';
+      if (password !== confirmPassword) {
+        resultDiv.innerHTML = '<span style="color:#b00020;">Passwords do not match.</span>';
+        return;
+      }
+      try {
+        const response = await fetch('/api/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, email, password })
+        });
+        const data = await response.json();
+        if (response.ok) {
+          resultDiv.innerHTML = '<span style="color:green;">Registration successful! You can now <a href="login.html">sign in</a>.</span>';
+          document.getElementById('register-form').reset();
+        } else {
+          resultDiv.innerHTML = `<span style="color:#b00020;">${data.error || 'Registration failed.'}</span>`;
+        }
+      } catch (err) {
+        resultDiv.innerHTML = `<span style="color:#b00020;">Error: ${err.message}</span>`;
+      }
+    });
+  </script>
+</body>
+</html> 

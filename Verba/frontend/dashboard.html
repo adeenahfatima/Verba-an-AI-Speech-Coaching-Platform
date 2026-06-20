@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard - Verba</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <img src="logo.png" alt="Verba Logo" class="logo">
+      <span class="brand">Verba</span>
+    </div>
+    <div class="header-right">
+      <a href="upload.html" class="btn btn-primary">Upload New Audio</a>
+      <a href="#" id="logout-btn" class="btn btn-secondary">Logout</a>
+    </div>
+  </header>
+  <main class="main-content">
+    <section class="intro-section" id="recent-analysis-section">
+      <h2>Most Recent Analysis</h2>
+      <div id="recent-analysis"></div>
+    </section>
+    <section class="intro-section" id="profile-section">
+      <h1 id="welcome-user">Welcome!</h1>
+      <div id="user-stats" style="margin-top: 16px;"></div>
+    </section>
+    <!-- Progress Tracking Section -->
+    <section class="feature-card" id="progress-section" style="max-width:900px; margin:32px auto 0 auto; padding:32px 24px 24px 24px; border-radius:80px; box-shadow:0 4px 16px rgba(0,0,0,0.08); background:#fff; overflow:hidden;">
+      <h2 class="feature-title" style="text-align:center; color:#000000; margin-bottom:18px; font-size:2.5rem;">Your Progress</h2>
+      <div id="streak-bar" style="margin: 18px 0 24px 0; font-size: 2.5em; font-weight: bold; text-align:center;"></div>
+      <div id="progress-toggles" style="margin: 12px 0 24px 0; display: flex; flex-wrap: wrap; gap: 10px; justify-content:center;"></div>
+      <div id="progress-charts-wrapper">
+        <canvas id="progressLineChart" height="120" style="margin: bottom 16px; background:#f8f9fa; border-radius:12px; box-shadow:0 2px 8px #eee;"></canvas>
+        <canvas id="progressBarChart" height="80" style="background:#f8f9fa; border-radius:80px; box-shadow:0 2px 8px #eee;"></canvas>
+      </div>
+      <div id="progress-no-data" style="display:none; text-align:center; color:#888; font-size:1.2rem; margin-top:24px;">No progress data to display yet. Upload a speech to see your progress!</div>
+    </section>
+    <section class="feature-cards" id="uploads-list" style="display: flex; flex-direction: column; align-items: center;"></section>
+  </main>
+  <footer class="footer">
+    <div class="footer-left">
+      <div class="footer-brand-row">
+        <img src="logo.png" alt="Verba Logo" class="footer-logo">
+        <span>Verba</span>
+      </div>
+      <div class="footer-desc">Your personal AI companion for confident communication.</div>
+      <div class="footer-copy">&copy; Copyright 2025. All rights reserved.</div>
+      <div class="footer-copy">&copy; Made with ❤️ by Adina Fatima.</div>
+    </div>
+    <div class="footer-links">
+      <div>
+        <strong>Customer Service</strong>
+        <ul>
+          <li>Contact Us</li>
+          <li>Privacy Policy</li>
+          <li>Terms and Conditions</li>
+        </ul>
+      </div>
+      <div>
+        <strong>Use Cases</strong>
+        <ul>
+          <li>Class Presentations</li>
+          <li>Interviews</li>
+          <li>Debates</li>
+          <li>Speech Practice</li>
+          <li>Personal Confidence</li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    console.log('Dashboard script loaded');
+    // Get logged-in user
+    const user = JSON.parse(localStorage.getItem('verbaUser'));
+    if (!user) {
+      window.location.href = 'login.html';
+    }
+    document.getElementById('welcome-user').textContent = `Welcome, ${user.username}!`;
+
+    // Fetch and display user stats
+    fetch(`/api/profile/${user.id}`)
+      .then(res => res.json())
+      .then(stats => {
+        document.getElementById('user-stats').innerHTML = `
+          <div style="display:flex; gap:32px; justify-content:center; flex-wrap:wrap;">
+            <div class="feature-card"><div class="feature-title">Best WPM</div><div class="feature-body" style="min-width:150px; padding:12px 24px; border-radius:16px;">${stats.best_wpm || 0}</div></div>
+            <div class="feature-card"><div class="feature-title">Lowest Filler Words</div><div class="feature-body" style="min-width:150px; padding:12px 24px; border-radius:16px;">${stats.lowest_filler || 0}</div></div>
+            <div class="feature-card"><div class="feature-title">Longest Speech (words)</div><div class="feature-body" style="min-width:150px; padding:12px 24px; border-radius:16px;">${stats.longest_speech || 0}</div></div>
+            <div class="feature-card"><div class="feature-title">Total Uploads</div><div class="feature-body" style="min-width:150px; padding:12px 24px; border-radius:16px;">${stats.total_uploads || 0}</div></div>
+          </div>
+        `;
+      });
+
+    // Progress Tracking Logic
+    function calculateStreak(uploads) {
+      if (!uploads.length) return 0;
+      const days = uploads.map(u => (new Date(u.timestamp)).toDateString());
+      let streak = 1, maxStreak = 1;
+      for (let i = 1; i < days.length; i++) {
+        const prev = new Date(days[i-1]);
+        const curr = new Date(days[i]);
+        const diff = (prev - curr) / (1000*60*60*24);
+        if (diff === 1) streak++;
+        else streak = 1;
+        if (streak > maxStreak) maxStreak = streak;
+      }
+      return maxStreak;
+    }
+    function renderProgressCharts(uploads) {
+      const chartsWrapper = document.getElementById('progress-charts-wrapper');
+      const noDataDiv = document.getElementById('progress-no-data');
+      if (!uploads.length) {
+        chartsWrapper.style.display = 'none';
+        noDataDiv.style.display = 'block';
+        return;
+      } else {
+        chartsWrapper.style.display = 'block';
+        noDataDiv.style.display = 'none';
+      }
+      // Sort uploads by timestamp ascending
+      uploads = [...uploads].sort((a,b) => new Date(a.timestamp) - new Date(b.timestamp));
+      const labels = uploads.map(u => new Date(u.timestamp).toLocaleDateString());
+      // Metrics to plot
+      const metrics = {
+        'WPM': uploads.map(u => u.wpm),
+        'Score': uploads.map(u => u.score),
+        'Pitch Mean (Hz)': uploads.map(u => u.pitch_mean_hz),
+        'Pitch Variation (%)': uploads.map(u => u.pitch_variation_percent),
+        'Vocab Richness': uploads.map(u => u.vocab_richness),
+        'Volume Mean': uploads.map(u => u.volume_mean),
+        'Volume Std': uploads.map(u => u.volume_std),
+        'Noise Level': uploads.map(u => u.noise_level),
+        'Sentence Variety': uploads.map(u => u.sentence_var),
+      };
+      const barMetrics = {
+        'Filler Words': uploads.map(u => u.filler_count),
+        'Pauses': uploads.map(u => u.pause_count),
+        'Advanced Vocab Count': uploads.map(u => u.advanced_vocab_count),
+      };
+      // Line chart (multi-metric, toggleable)
+      const colors = [
+        '#007bff','#28a745','#ffc107','#dc3545','#6f42c1','#20c997','#fd7e14','#6610f2','#17a2b8'
+      ];
+      let enabledMetrics = [];
+      function updateLineChart() {
+        let datasets = [];
+        if (enabledMetrics.length > 0) {
+          datasets = enabledMetrics.map((key, i) => ({
+            label: key,
+            data: metrics[key],
+            borderColor: colors[i%colors.length],
+            backgroundColor: colors[i%colors.length]+'33',
+            fill: false,
+            tension: 0.2,
+            pointRadius: 2
+          }));
+        }
+        if (window.progressLineChart && typeof window.progressLineChart.destroy === 'function') {
+          window.progressLineChart.destroy();
+        }
+        window.progressLineChart = new Chart(document.getElementById('progressLineChart').getContext('2d'), {
+          type: 'line',
+          data: { labels, datasets },
+          options: {
+            responsive: true,
+            plugins: { legend: { display: true } },
+            scales: { x: { title: { display: true, text: 'Date' } } },
+            animation: false,
+            elements: { line: { borderWidth: 3 } },
+            plugins: {
+              legend: { display: enabledMetrics.length > 0 },
+              tooltip: { enabled: enabledMetrics.length > 0 },
+            },
+            plugins: {
+              legend: { display: enabledMetrics.length > 0 },
+              tooltip: { enabled: enabledMetrics.length > 0 },
+            },
+            plugins: {
+              legend: { display: enabledMetrics.length > 0 },
+              tooltip: { enabled: enabledMetrics.length > 0 },
+              title: {
+                display: enabledMetrics.length === 0,
+                text: enabledMetrics.length === 0 ? 'Select a metric to display progress.' : '',
+                color: '#888',
+                font: { size: 18 }
+              }
+            }
+          }
+        });
+      }
+      // Metric toggles
+      const togglesDiv = document.getElementById('progress-toggles');
+      togglesDiv.innerHTML = '';
+      Object.keys(metrics).forEach(key => {
+        const btn = document.createElement('button');
+        btn.textContent = key;
+        btn.className = 'btn btn-secondary';
+        btn.style.opacity = enabledMetrics.includes(key) ? '1' : '0.5';
+        btn.style.borderRadius = '18px';
+        btn.style.padding = '6px 18px';
+        btn.style.fontSize = '1rem';
+        btn.style.marginBottom = '6px';
+        btn.style.transition = 'opacity 0.2s';
+        btn.onclick = () => {
+          if (enabledMetrics.includes(key)) {
+            enabledMetrics = enabledMetrics.filter(k => k !== key);
+          } else {
+            enabledMetrics.push(key);
+          }
+          btn.style.opacity = enabledMetrics.includes(key) ? '1' : '0.5';
+          updateLineChart();
+        };
+        togglesDiv.appendChild(btn);
+      });
+      updateLineChart();
+      // Bar chart (for count metrics)
+      if (window.progressBarChart && typeof window.progressBarChart.destroy === 'function') {
+        window.progressBarChart.destroy();
+      }
+      window.progressBarChart = new Chart(document.getElementById('progressBarChart').getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: Object.keys(barMetrics).map((key, i) => ({
+            label: key,
+            data: barMetrics[key],
+            backgroundColor: colors[(i+3)%colors.length]+'99',
+          }))
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: true } },
+          scales: { x: { title: { display: true, text: 'Date' } } }
+        }
+      });
+      // Streak bar
+      const streak = calculateStreak(uploads);
+      document.getElementById('streak-bar').innerHTML = `🔥 <span style="color:#007bff;">${streak}-day streak!</span> Keep practicing!`;
+    }
+    // Fetch and display upload history + progress
+    fetch(`/api/uploads/${user.id}`)
+      .then(res => res.json())
+      .then(uploads => {
+        console.log('Uploads:', uploads);
+        renderProgressCharts(uploads);
+        // Most Recent Analysis
+        const recentDiv = document.getElementById('recent-analysis');
+        if (!uploads.length) {
+          recentDiv.innerHTML = '<div style="text-align:center;">No uploads yet. Upload a file to see your analysis here!</div>';
+        } else {
+          const u = uploads[0];
+          recentDiv.innerHTML = `
+            <div class="feature-card" style="max-width:700px; margin:0 auto;">
+              <div class="feature-title">${u.filename} <span style="font-size:0.9rem; color:#888;">(${new Date(u.timestamp).toLocaleString()})</span></div>
+              <div class="feature-body"><b>WPM:</b> ${u.wpm} &nbsp; <b>Filler Words:</b> ${u.filler_count} &nbsp; <b>Pauses:</b> ${u.pause_count} &nbsp; <b>Total Words:</b> ${u.total_words}</div>
+              <div class="feature-body" style="margin-top:10px;">
+                <button onclick="showDetails(${JSON.stringify(u).replace(/\"/g, '&quot;')})" class="btn btn-secondary" style="margin-top:8px;">View Full Transcript</button>
+              </div>
+            </div>
+          `;
+        }
+        // Uploads list (history)
+        const uploadsList = document.getElementById('uploads-list');
+        uploadsList.innerHTML = '<h2 style="text-align:center; margin-bottom:24px; width:100%;">Upload History</h2>';
+        if (!uploads.length) {
+          uploadsList.innerHTML += '<div style="text-align:center; width:100%;">No uploads yet.</div>';
+          return;
+        }
+        uploadsList.innerHTML += '<div id="uploads-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 32px; width: 100%; max-width: 1200px; margin: 0 auto;">';
+        uploads.forEach(u => {
+          document.getElementById('uploads-grid').innerHTML += `
+            <div class="feature-card" style="min-width:320px; max-width:600px; display: flex; flex-direction: column; align-items: center; text-align: center; justify-content: center; border-radius:16px;">
+              <div class="feature-title" style="width:100%; text-align:center;">${u.filename} <span style="font-size:0.9rem; color:#888;">(${new Date(u.timestamp).toLocaleString()})</span></div>
+              <div class="feature-body" style="margin-bottom: 8px;"><b>WPM:</b> ${u.wpm} &nbsp; <b>Filler Words:</b> ${u.filler_count} &nbsp; <b>Pauses:</b> ${u.pause_count}</div>
+              <div class="feature-body" style="margin-bottom: 18px;"><b>Total Words:</b> ${u.total_words}</div>
+              <button onclick="showDetails(${JSON.stringify(u).replace(/\"/g, '&quot;')})" class="btn btn-secondary" style="margin-top: 8px;">View Details</button>
+            </div>
+          `;
+        });
+        uploadsList.innerHTML += '</div>';
+      });
+
+    // Function to show upload details in modal
+    window.showDetails = function(upload) {
+      const modal = document.createElement('div');
+      modal.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0,0,0,0.5);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      `;
+      
+      modal.innerHTML = `
+        <div style="
+          background: white;
+          padding: 32px;
+          border-radius: 16px;
+          max-width: 800px;
+          max-height: 80vh;
+          overflow-y: auto;
+          box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        ">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+            <h2 style="margin: 0;">${upload.filename}</h2>
+            <button onclick="this.closest('.modal').remove()" style="
+              background: none;
+              border: none;
+              font-size: 24px;
+              cursor: pointer;
+              color: #666;
+            ">&times;</button>
+          </div>
+
+          <div style="margin-bottom: 24px; text-align:center;">
+            <div style="font-size: 2.5rem; font-weight: bold; color: #007bff; margin-bottom: 8px;">${upload.score !== undefined ? upload.score + '/100' : 'N/A'}</div>
+            <div style="font-size: 1.1rem; color: #444; margin-bottom: 16px;">Overall Score</div>
+            <div style="display: flex; flex-wrap: wrap; gap: 16px; justify-content: center;">
+              <div style="background:#f8f9fa; border-radius:8px; padding:12px 18px; min-width:170px; display: flex; flex-direction: column; align-items: center;">
+                <b>Pitch:</b> <span style="font-size:1.2em; font-weight:600;">${upload.pitch_mean_hz !== undefined && upload.pitch_mean_hz !== null ? upload.pitch_mean_hz + ' Hz' : 'N/A'}</span><br>
+                <span style="font-size:12px; color:#888;">${upload.pitch_mean_explained || ''}</span>
+              </div>
+              <div style="background:#f8f9fa; border-radius:8px; padding:12px 18px; min-width:170px;">
+                <b>Volume Mean:</b> ${upload.volume_mean !== undefined && upload.volume_mean !== null ? upload.volume_mean.toFixed(4) : 'N/A'}<br>
+                <b>Std:</b> ${upload.volume_std !== undefined && upload.volume_std !== null ? upload.volume_std.toFixed(4) : 'N/A'}<br>
+                <span style="font-size:12px; color:#888;">(Consistency is good)</span>
+              </div>
+              <div style="background:#f8f9fa; border-radius:8px; padding:12px 18px; min-width:170px;">
+                <b>Noise Level:</b> ${upload.noise_level !== undefined && upload.noise_level !== null ? upload.noise_level.toFixed(2) : 'N/A'}<br>
+                <span style="font-size:12px; color:#888;">(Lower = clearer audio)</span>
+              </div>
+              <div style="background:#f8f9fa; border-radius:8px; padding:12px 18px; min-width:170px;">
+                <b>Vocab Richness:</b> ${upload.vocab_richness !== undefined && upload.vocab_richness !== null ? (upload.vocab_richness*100).toFixed(1) + '%' : 'N/A'}<br>
+                <span style="font-size:12px; color:#888;">(Unique words / total)</span>
+              </div>
+              <div style="background:#f8f9fa; border-radius:8px; padding:12px 18px; min-width:170px;">
+                <b>Adv. Vocab:</b> ${upload.advanced_vocab_count !== undefined && upload.advanced_vocab_count !== null ? upload.advanced_vocab_count : 'N/A'}<br>
+                <span style="font-size:12px; color:#888;">(Uncommon words used)</span>
+              </div>
+              <div style="background:#f8f9fa; border-radius:8px; padding:12px 18px; min-width:170px;">
+                <b>Sentence Var.:</b> ${upload.sentence_var !== undefined && upload.sentence_var !== null ? upload.sentence_var.toFixed(2) : 'N/A'}<br>
+                <span style="font-size:12px; color:#888;">(Sentence length variety)</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-bottom: 24px; display: flex; align-items: flex-start; gap: 12px;">
+            <b style="margin-top: 6px;">Uncommon Words:</b>
+            <span style="font-size: 1rem; color: #007bff; display: flex; align-items: center; gap: 10px;">
+              <button onclick="toggleUncommonWords(this)" class="btn btn-secondary uncommon-toggle-btn" style="padding: 4px 22px; font-size: 1rem; margin-bottom: 6px;">Show</button>
+              <span class="uncommon-words-list" style="display:none;">${upload.advanced_words && upload.advanced_words.length ? upload.advanced_words.join(', ') : 'None'}</span>
+            </span>
+          </div>
+
+          <div style="margin-bottom: 24px;">
+          <h3 style="margin-bottom: 12px; color: #007bff;">Actionable Tips</h3>
+          <ul style="text-align:left; max-width:600px; margin:0 auto; font-size:1.08rem; color:#222;">
+            <li style='margin-bottom:8px;'>Slow down slightly to emphasize important points.</li>
+            <li style='margin-bottom:8px;'>Reduce filler words like "um" and "uh" for clarity.</li>
+            <li style='margin-bottom:8px;'>Maintain a consistent tone and pace for smoother delivery.</li>
+          </ul>
+        </div>
+
+
+          <div style="margin-bottom: 32px; display: flex; justify-content: center;">
+            <div style="background: linear-gradient(90deg, #e0e7ff 0%, #fffbe0 100%); border-radius: 18px; box-shadow: 0 4px 16px rgba(0,0,0,0.10); padding: 24px 32px; max-width: 600px; width: 100%; display: flex; align-items: flex-start; gap: 18px; border: 2px solid #b3b3ff;">
+              <div>
+                <div style="font-size: 1.15rem; font-weight: 700; color: #6c63ff; margin-bottom: 8px; letter-spacing: 0.01em;">AI-Powered Bonus Advice</div>
+                <div style="font-size: 1.08rem; color: #222;">
+                  Practice in a quiet environment to minimize background noise. Focus on articulating clearly and varying your pitch naturally. Confidence improves with repetition—keep speaking regularly!
+                </div>
+              </div>
+            </div>
+          </div>
+
+
+          <div style="margin-bottom: 24px;">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; margin-bottom: 16px;">
+              <div style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 8px;">
+                <div style="font-size: 24px; font-weight: bold; color: #007bff;">${upload.wpm}</div>
+                <div style="font-size: 14px; color: #666;">Words per Minute</div>
+              </div>
+              <div style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 8px;">
+                <div style="font-size: 24px; font-weight: bold; color: #dc3545;">${upload.filler_count}</div>
+                <div style="font-size: 14px; color: #666;">Filler Words</div>
+              </div>
+              <div style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 8px;">
+                <div style="font-size: 24px; font-weight: bold; color: #ffc107;">${upload.pause_count}</div>
+                <div style="font-size: 14px; color: #666;">Pauses</div>
+              </div>
+              <div style="text-align: center; padding: 16px; background: #f8f9fa; border-radius: 8px;">
+                <div style="font-size: 24px; font-weight: bold; color: #28a745;">${upload.total_words}</div>
+                <div style="font-size: 14px; color: #666;">Total Words</div>
+              </div>
+            </div>
+          </div>
+          <div>
+            <h3 style="margin-bottom: 16px;">Full Transcript</h3>
+            <div style="
+              background: #f8f9fa;
+              padding: 20px;
+              border-radius: 8px;
+              font-size: 16px;
+              line-height: 1.6;
+              color: #333;
+              max-height: 300px;
+              overflow-y: auto;
+            ">${upload.transcript}</div>
+          </div>
+          <div style="margin-top: 24px; text-align: center;">
+            <button onclick="this.closest('.modal').remove()" class="btn btn-primary">Close</button>
+          </div>
+        </div>
+      `;
+      
+      modal.className = 'modal';
+      document.body.appendChild(modal);
+      
+      // Close modal when clicking outside
+      modal.addEventListener('click', function(e) {
+        if (e.target === modal) {
+          modal.remove();
+        }
+      });
+    };
+
+    // Toggle function for uncommon words
+    window.toggleUncommonWords = function(btn) {
+      const list = btn.parentElement.querySelector('.uncommon-words-list');
+      if (list.style.display === 'none') {
+        list.style.display = 'inline';
+        btn.textContent = 'Hide';
+      } else {
+        list.style.display = 'none';
+        btn.textContent = 'Show';
+      }
+    }
+
+    // Add theme styling for uncommon words toggle button
+    const uncommonBtnStyle = document.createElement('style');
+    uncommonBtnStyle.innerHTML = `
+      .uncommon-toggle-btn {
+        border-radius: var(--radius);
+        font-weight: 700;
+        background: var(--bg);
+        color: var(--text);
+        border: 2px solid var(--border);
+        transition: background 0.18s, box-shadow 0.18s;
+        box-shadow: var(--shadow-soft);
+        letter-spacing: 0.03em;
+      }
+      .uncommon-toggle-btn:hover {
+        background: #ffe066;
+        color: #181818;
+      }
+    `;
+    document.head.appendChild(uncommonBtnStyle);
+
+    // Logout functionality
+    document.getElementById('logout-btn').onclick = function() {
+      localStorage.removeItem('verbaUser');
+      window.location.href = 'login.html';
+    };
+  </script>
+</body>
+</html> 
