@@ -339,6 +339,28 @@ def transcribe():
         "message": "Upload files through the frontend to get full analysis and database storage."
     }), 400
 
+# --- Background job tracking for progress polling ---
+import uuid
+import threading
+
+# In-memory job store. Fine for single-worker (--workers 1) deployments;
+# if you ever scale to multiple workers, this needs to move to Redis/DB instead.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+def set_job_progress(job_id, status, percent, **extra):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update({"status": status, "percent": percent, **extra})
+
+@app.route('/api/job_status/<job_id>', methods=['GET'])
+def job_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
+
 @app.route('/api/transcribe_upload', methods=['POST'])
 @app.route('/transcribe_upload', methods=['POST'])
 def transcribe_upload():
@@ -351,303 +373,336 @@ def transcribe_upload():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
-    try:
-        # Save the uploaded file with its original extension first
-        filename = file.filename.lower()
-        orig_suffix = os.path.splitext(filename)[1] or '.bin'
-        with tempfile.NamedTemporaryFile(delete=False, suffix=orig_suffix) as tmp_orig:
-            file.save(tmp_orig.name)
-            orig_path = tmp_orig.name
+    # Save the upload synchronously (fast) so the file object isn't tied to
+    # this request thread before we hand off to the background worker.
+    filename = file.filename.lower()
+    orig_suffix = os.path.splitext(filename)[1] or '.bin'
+    with tempfile.NamedTemporaryFile(delete=False, suffix=orig_suffix) as tmp_orig:
+        file.save(tmp_orig.name)
+        orig_path = tmp_orig.name
 
-        # Convert to a real WAV file using pydub/ffmpeg, regardless of input format
-        # (browsers/devices send mp3, ogg/opus, m4a, aac, wma, webm, etc. — pydub
-        # auto-detects the real format from file content via ffmpeg, not extension)
+    job_id = str(uuid.uuid4())
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "queued", "percent": 0}
+
+    # Flask's request/app context doesn't carry into a raw thread automatically,
+    # so we capture app and pass the real filename in explicitly.
+    thread = threading.Thread(
+        target=process_audio_job,
+        args=(job_id, orig_path, user_id, file.filename),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({"job_id": job_id}), 202
+
+def process_audio_job(job_id, orig_path, user_id, original_filename):
+    with app.app_context():
         try:
-            audio_seg = AudioSegment.from_file(orig_path)
-            tmp_path = orig_path + '_converted.wav'
-            audio_seg.export(tmp_path, format='wav')
-        except Exception as conv_err:
-            print(f"Audio conversion failed: {conv_err}")
-            return jsonify({'error': 'Could not process audio file. Please upload a valid audio file (mp3, wav, ogg, m4a, etc.).'}), 400
-        finally:
-            # Clean up the original upload now that we have the converted version
+            set_job_progress(job_id, "converting", 5)
+            # Convert to a real WAV file using pydub/ffmpeg, regardless of input format
+            # (browsers/devices send mp3, ogg/opus, m4a, aac, wma, webm, etc. — pydub
+            # auto-detects the real format from file content via ffmpeg, not extension)
             try:
-                os.remove(orig_path)
-            except OSError:
-                pass
+                audio_seg = AudioSegment.from_file(orig_path)
+                tmp_path = orig_path + '_converted.wav'
+                audio_seg.export(tmp_path, format='wav')
+            except Exception as conv_err:
+                print(f"Audio conversion failed: {conv_err}")
+                set_job_progress(job_id, "error", 0, error="Could not process audio file. Please upload a valid audio file (mp3, wav, ogg, m4a, etc.).")
+                return
+            finally:
+                try:
+                    os.remove(orig_path)
+                except OSError:
+                    pass
 
-        print(f"Processing audio file: {file.filename} -> {tmp_path}")
-        # --- Advanced Audio Metrics ---
-        pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
-        pitch_variation_percent = None
-        pitch_mean_hz = None
-        pitch_label = "Pitch not detected"
-        try:
-            import warnings
-            warnings.filterwarnings('ignore')
-            import parselmouth
-            snd = parselmouth.Sound(tmp_path)
-            Fs = snd.sampling_frequency
-            x = snd.values.T.flatten()
-            if len(x) == 0:
-                print("Audio file is empty")
-                raise ValueError("Empty audio file")
-            pitch = snd.to_pitch(time_step=0.01, pitch_floor=50.0, pitch_ceiling=500.0)
-            pitch_values = pitch.selected_array['frequency']
-            valid_pitch_values = pitch_values[
-                (pitch_values > 0) &
-                (pitch_values >= 50) &
-                (pitch_values <= 500) &
-                (~np.isnan(pitch_values)) &
-                (~np.isinf(pitch_values))
-            ]
-            print(f"Total pitch frames: {len(pitch_values)}")
-            print(f"Valid pitch frames: {len(valid_pitch_values)}")
-            if len(valid_pitch_values) > 5:
-                Q1 = np.percentile(valid_pitch_values, 10)
-                Q3 = np.percentile(valid_pitch_values, 90)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 2.0 * IQR
-                upper_bound = Q3 + 2.0 * IQR
-                filtered_pitch = valid_pitch_values[(valid_pitch_values >= lower_bound) & (valid_pitch_values <= upper_bound)]
-                if len(filtered_pitch) < len(valid_pitch_values) * 0.2:
-                    low = np.percentile(valid_pitch_values, 5)
-                    high = np.percentile(valid_pitch_values, 95)
-                    filtered_pitch = valid_pitch_values[(valid_pitch_values >= low) & (valid_pitch_values <= high)]
-                if len(filtered_pitch) > 0:
-                    pitch_mean = float(np.mean(filtered_pitch))
-                    pitch_std = float(np.std(filtered_pitch))
-                    pitch_mean_hz = round(pitch_mean)
-                    min_std = 2.0
-                    max_std = 20.0
-                    variation = np.clip((pitch_std - min_std) / (max_std - min_std), 0, 1)
-                    pitch_variation_percent = round(variation * 100)
-                    if pitch_mean < 85:
-                        pitch_label = "Very deep voice"
-                    elif pitch_mean < 110:
-                        pitch_label = "Deep voice"
-                    elif pitch_mean < 140:
-                        pitch_label = "Low-moderate voice"
-                    elif pitch_mean < 180:
-                        pitch_label = "Moderate voice"
-                    elif pitch_mean < 220:
-                        pitch_label = "Higher voice"
-                    elif pitch_mean < 300:
-                        pitch_label = "High voice"
-                    else:
-                        pitch_label = "Very high voice"
-                    print(f"Pitch analysis successful: mean={pitch_mean:.2f}Hz, std={pitch_std:.2f}, variation={pitch_variation_percent}%, label={pitch_label}")
-                else:
-                    print("No valid pitch values after filtering")
-                    pitch_std = 0.0
-                    pitch_mean = 0.0
-                    pitch_variation_percent = 0
-                    pitch_mean_hz = 0
-            else:
-                print(f"Insufficient voiced segments: only {len(valid_pitch_values)} frames")
-                pitch_std = 0.0
-                pitch_mean = 0.0
-                pitch_variation_percent = 0
-                pitch_mean_hz = 0
-            frame_length = int(0.050 * Fs)
-            hop_length = int(0.025 * Fs)
-            if len(x) >= frame_length:
-                frames = np.lib.stride_tricks.sliding_window_view(x, frame_length)[::hop_length]
-                rms = np.sqrt(np.mean(frames**2, axis=1))
-                valid_rms = rms[rms > 1e-10]
-                if len(valid_rms) > 0:
-                    volume_mean = float(np.mean(valid_rms))
-                    volume_std = float(np.std(valid_rms))
-                    mean_rms = np.mean(valid_rms)
-                    threshold = 0.1 * mean_rms
-                    low_energy_ratio = np.sum(valid_rms < threshold) / len(valid_rms)
-                    noise_level = float(low_energy_ratio)
-                else:
-                    volume_mean = volume_std = noise_level = None
-            else:
-                volume_mean = volume_std = noise_level = None
-        except ImportError:
-            print("parselmouth not installed. Please install with: pip install praat-parselmouth")
-            return jsonify({"error": "Speech analysis library not available. Please contact support."}), 500
-        except Exception as audio_err:
-            import traceback
-            traceback.print_exc()
+            print(f"Processing audio file: {original_filename} -> {tmp_path}")
+            set_job_progress(job_id, "analyzing_pitch", 20)
+
+            # --- Advanced Audio Metrics ---
             pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
             pitch_variation_percent = None
             pitch_mean_hz = None
             pitch_label = "Pitch not detected"
-        # Free parselmouth/numpy memory before the heavier Whisper transcription step
-        try:
-            del snd, x
-        except NameError:
-            pass
-        gc.collect()
+            try:
+                import warnings
+                warnings.filterwarnings('ignore')
+                import parselmouth
+                snd = parselmouth.Sound(tmp_path)
+                Fs = snd.sampling_frequency
+                x = snd.values.T.flatten()
+                if len(x) == 0:
+                    print("Audio file is empty")
+                    raise ValueError("Empty audio file")
+                pitch = snd.to_pitch(time_step=0.01, pitch_floor=50.0, pitch_ceiling=500.0)
+                pitch_values = pitch.selected_array['frequency']
+                valid_pitch_values = pitch_values[
+                    (pitch_values > 0) &
+                    (pitch_values >= 50) &
+                    (pitch_values <= 500) &
+                    (~np.isnan(pitch_values)) &
+                    (~np.isinf(pitch_values))
+                ]
+                print(f"Total pitch frames: {len(pitch_values)}")
+                print(f"Valid pitch frames: {len(valid_pitch_values)}")
+                if len(valid_pitch_values) > 5:
+                    Q1 = np.percentile(valid_pitch_values, 10)
+                    Q3 = np.percentile(valid_pitch_values, 90)
+                    IQR = Q3 - Q1
+                    lower_bound = Q1 - 2.0 * IQR
+                    upper_bound = Q3 + 2.0 * IQR
+                    filtered_pitch = valid_pitch_values[(valid_pitch_values >= lower_bound) & (valid_pitch_values <= upper_bound)]
+                    if len(filtered_pitch) < len(valid_pitch_values) * 0.2:
+                        low = np.percentile(valid_pitch_values, 5)
+                        high = np.percentile(valid_pitch_values, 95)
+                        filtered_pitch = valid_pitch_values[(valid_pitch_values >= low) & (valid_pitch_values <= high)]
+                    if len(filtered_pitch) > 0:
+                        pitch_mean = float(np.mean(filtered_pitch))
+                        pitch_std = float(np.std(filtered_pitch))
+                        pitch_mean_hz = round(pitch_mean)
+                        min_std = 2.0
+                        max_std = 20.0
+                        variation = np.clip((pitch_std - min_std) / (max_std - min_std), 0, 1)
+                        pitch_variation_percent = round(variation * 100)
+                        if pitch_mean < 85:
+                            pitch_label = "Very deep voice"
+                        elif pitch_mean < 110:
+                            pitch_label = "Deep voice"
+                        elif pitch_mean < 140:
+                            pitch_label = "Low-moderate voice"
+                        elif pitch_mean < 180:
+                            pitch_label = "Moderate voice"
+                        elif pitch_mean < 220:
+                            pitch_label = "Higher voice"
+                        elif pitch_mean < 300:
+                            pitch_label = "High voice"
+                        else:
+                            pitch_label = "Very high voice"
+                        print(f"Pitch analysis successful: mean={pitch_mean:.2f}Hz, std={pitch_std:.2f}, variation={pitch_variation_percent}%, label={pitch_label}")
+                    else:
+                        print("No valid pitch values after filtering")
+                        pitch_std = 0.0
+                        pitch_mean = 0.0
+                        pitch_variation_percent = 0
+                        pitch_mean_hz = 0
+                else:
+                    print(f"Insufficient voiced segments: only {len(valid_pitch_values)} frames")
+                    pitch_std = 0.0
+                    pitch_mean = 0.0
+                    pitch_variation_percent = 0
+                    pitch_mean_hz = 0
+                frame_length = int(0.050 * Fs)
+                hop_length = int(0.025 * Fs)
+                if len(x) >= frame_length:
+                    frames = np.lib.stride_tricks.sliding_window_view(x, frame_length)[::hop_length]
+                    rms = np.sqrt(np.mean(frames**2, axis=1))
+                    valid_rms = rms[rms > 1e-10]
+                    if len(valid_rms) > 0:
+                        volume_mean = float(np.mean(valid_rms))
+                        volume_std = float(np.std(valid_rms))
+                        mean_rms = np.mean(valid_rms)
+                        threshold = 0.1 * mean_rms
+                        low_energy_ratio = np.sum(valid_rms < threshold) / len(valid_rms)
+                        noise_level = float(low_energy_ratio)
+                    else:
+                        volume_mean = volume_std = noise_level = None
+                else:
+                    volume_mean = volume_std = noise_level = None
+            except ImportError:
+                print("parselmouth not installed. Please install with: pip install praat-parselmouth")
+                set_job_progress(job_id, "error", 0, error="Speech analysis library not available. Please contact support.")
+                return
+            except Exception as audio_err:
+                import traceback
+                traceback.print_exc()
+                pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
+                pitch_variation_percent = None
+                pitch_mean_hz = None
+                pitch_label = "Pitch not detected"
 
-        # --- Whisper Transcription ---
-        result = model.transcribe(tmp_path, fp16=False)
-        transcript = result['text']
-        if isinstance(transcript, list):
-            transcript = " ".join(transcript)
-        segments = result['segments']
-        del result
-        # Clean up the temp WAV file now — nothing downstream needs the audio anymore
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        gc.collect()
-        filler_words = ["um", "uh", "like", "you know"]
-        words = nltk.word_tokenize(transcript.lower())
-        total_words = len(words)
-        filler_count = sum(words.count(filler) for filler in filler_words)
-        pause_count = 0
-        for i in range(1, len(segments)):
-            gap = get_float(segments[i], 'start') - get_float(segments[i-1], 'end')
-            if gap > 2:
-                pause_count += 1
-        duration = get_float(segments[-1], 'end') if segments else 1.0
-        wpm = (total_words / duration) * 60 if duration > 0 else 0
-        vocab_richness = advanced_vocab_count = sentence_var = None
-        try:
-            unique_words = set(words)
-            vocab_richness = len(unique_words) / total_words if total_words > 0 else None
-            common_words = COMMON_WORDS_SET
-            advanced_words = [w for w in unique_words if w.isalpha() and w not in common_words]
-            advanced_vocab_count = len(advanced_words)
-            sentences = nltk.sent_tokenize(transcript)
-            sentence_lengths = [len(nltk.word_tokenize(s)) for s in sentences]
-            sentence_var = float(np.std(sentence_lengths)) if len(sentence_lengths) > 1 else None
-        except Exception as text_err:
-            print(f"Transcript analysis error: {text_err}")
+            # Free parselmouth/numpy memory before the heavier Whisper transcription step
+            try:
+                del snd, x
+            except NameError:
+                pass
+            gc.collect()
+
+            set_job_progress(job_id, "transcribing", 45)
+
+            # --- Whisper Transcription ---
+            result = model.transcribe(tmp_path, fp16=False)
+            transcript = result['text']
+            if isinstance(transcript, list):
+                transcript = " ".join(transcript)
+            segments = result['segments']
+            del result
+            # Clean up the temp WAV file now — nothing downstream needs the audio anymore
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            gc.collect()
+
+            set_job_progress(job_id, "scoring", 80)
+
+            filler_words = ["um", "uh", "like", "you know"]
+            words = nltk.word_tokenize(transcript.lower())
+            total_words = len(words)
+            filler_count = sum(words.count(filler) for filler in filler_words)
+            pause_count = 0
+            for i in range(1, len(segments)):
+                gap = get_float(segments[i], 'start') - get_float(segments[i-1], 'end')
+                if gap > 2:
+                    pause_count += 1
+            duration = get_float(segments[-1], 'end') if segments else 1.0
+            wpm = (total_words / duration) * 60 if duration > 0 else 0
             vocab_richness = advanced_vocab_count = sentence_var = None
-        score = 0
-        try:
-            if 110 <= wpm <= 160:
-                score += 15
-            elif 90 <= wpm < 110 or 160 < wpm <= 180:
-                score += 10
-            elif 70 <= wpm < 90 or 180 < wpm <= 200:
-                score += 5
-            if filler_count == 0:
-                score += 15
-            elif filler_count <= 2:
-                score += 10
-            elif filler_count <= 5:
-                score += 5
-            if pause_count <= 2:
-                score += 10
-            elif pause_count <= 5:
-                score += 5
-            if pitch_variation_percent is not None:
-                score += round(pitch_variation_percent / 10)
-            if volume_std is not None:
-                if volume_std < 0.01:
-                    score += 10
-                elif volume_std < 0.03:
-                    score += 7
-                elif volume_std < 0.05:
-                    score += 4
-            if noise_level is not None:
-                if noise_level < 0.2:
-                    score += 10
-                elif noise_level < 0.4:
-                    score += 7
-                elif noise_level < 0.6:
-                    score += 4
-            if vocab_richness is not None:
-                if vocab_richness > 0.5:
-                    score += 10
-                elif vocab_richness > 0.3:
-                    score += 7
-                elif vocab_richness > 0.15:
-                    score += 4
-            if advanced_vocab_count is not None:
-                if advanced_vocab_count > 10:
-                    score += 5
-                elif advanced_vocab_count > 5:
-                    score += 3
-            if sentence_var is not None:
-                if sentence_var > 5:
-                    score += 5
-                elif sentence_var > 2:
-                    score += 3
-        except Exception as score_err:
-            print(f"Score calculation error: {score_err}")
+            advanced_words = []
+            try:
+                unique_words = set(words)
+                vocab_richness = len(unique_words) / total_words if total_words > 0 else None
+                common_words = COMMON_WORDS_SET
+                advanced_words = [w for w in unique_words if w.isalpha() and w not in common_words]
+                advanced_vocab_count = len(advanced_words)
+                sentences = nltk.sent_tokenize(transcript)
+                sentence_lengths = [len(nltk.word_tokenize(s)) for s in sentences]
+                sentence_var = float(np.std(sentence_lengths)) if len(sentence_lengths) > 1 else None
+            except Exception as text_err:
+                print(f"Transcript analysis error: {text_err}")
+                vocab_richness = advanced_vocab_count = sentence_var = None
             score = 0
-        print(f"Analysis complete: {total_words} words, {filler_count} fillers, {pause_count} pauses, {wpm:.2f} wpm, pitch std: {pitch_std}, volume std: {volume_std}, noise: {noise_level}, vocab richness: {vocab_richness}, advanced vocab: {advanced_vocab_count}, sentence var: {sentence_var}, score: {score}")
-        # Find this section in your transcribe_upload function and replace it:
+            try:
+                if 110 <= wpm <= 160:
+                    score += 15
+                elif 90 <= wpm < 110 or 160 < wpm <= 180:
+                    score += 10
+                elif 70 <= wpm < 90 or 180 < wpm <= 200:
+                    score += 5
+                if filler_count == 0:
+                    score += 15
+                elif filler_count <= 2:
+                    score += 10
+                elif filler_count <= 5:
+                    score += 5
+                if pause_count <= 2:
+                    score += 10
+                elif pause_count <= 5:
+                    score += 5
+                if pitch_variation_percent is not None:
+                    score += round(pitch_variation_percent / 10)
+                if volume_std is not None:
+                    if volume_std < 0.01:
+                        score += 10
+                    elif volume_std < 0.03:
+                        score += 7
+                    elif volume_std < 0.05:
+                        score += 4
+                if noise_level is not None:
+                    if noise_level < 0.2:
+                        score += 10
+                    elif noise_level < 0.4:
+                        score += 7
+                    elif noise_level < 0.6:
+                        score += 4
+                if vocab_richness is not None:
+                    if vocab_richness > 0.5:
+                        score += 10
+                    elif vocab_richness > 0.3:
+                        score += 7
+                    elif vocab_richness > 0.15:
+                        score += 4
+                if advanced_vocab_count is not None:
+                    if advanced_vocab_count > 10:
+                        score += 5
+                    elif advanced_vocab_count > 5:
+                        score += 3
+                if sentence_var is not None:
+                    if sentence_var > 5:
+                        score += 5
+                    elif sentence_var > 2:
+                        score += 3
+            except Exception as score_err:
+                print(f"Score calculation error: {score_err}")
+                score = 0
+            print(f"Analysis complete: {total_words} words, {filler_count} fillers, {pause_count} pauses, {wpm:.2f} wpm, pitch std: {pitch_std}, volume std: {volume_std}, noise: {noise_level}, vocab richness: {vocab_richness}, advanced vocab: {advanced_vocab_count}, sentence var: {sentence_var}, score: {score}")
 
-        upload = Upload(
-            user_id=user_id,
-            filename=file.filename,
-            transcript=transcript,
-            total_words=total_words,
-            filler_count=filler_count,
-            pause_count=pause_count,
-            wpm=round(wpm, 2),
-            pitch_std=pitch_std,
-            pitch_mean=pitch_mean,
-            pitch_mean_hz=pitch_mean_hz,  
-            pitch_label=pitch_label,      
-            pitch_variation_percent=pitch_variation_percent,  
-            volume_mean=volume_mean,
-            volume_std=volume_std,
-            noise_level=noise_level,
-            vocab_richness=vocab_richness,
-            advanced_vocab_count=advanced_vocab_count,
-            sentence_var=sentence_var,
-            score=score,
-            advanced_words=json.dumps(advanced_words)
-        )
-        db.session.add(upload)
-        db.session.commit()
-        if pitch_mean_hz is not None and pitch_mean_hz > 0:
-            pitch_explanation = f"{pitch_mean_hz} Hz — {pitch_label}"
-        else:
-            pitch_explanation = "N/A — Pitch not detected (audio may be too quiet or unclear)"
+            upload = Upload(
+                user_id=user_id,
+                filename=original_filename,
+                transcript=transcript,
+                total_words=total_words,
+                filler_count=filler_count,
+                pause_count=pause_count,
+                wpm=round(wpm, 2),
+                pitch_std=pitch_std,
+                pitch_mean=pitch_mean,
+                pitch_mean_hz=pitch_mean_hz,
+                pitch_label=pitch_label,
+                pitch_variation_percent=pitch_variation_percent,
+                volume_mean=volume_mean,
+                volume_std=volume_std,
+                noise_level=noise_level,
+                vocab_richness=vocab_richness,
+                advanced_vocab_count=advanced_vocab_count,
+                sentence_var=sentence_var,
+                score=score,
+                advanced_words=json.dumps(advanced_words)
+            )
+            db.session.add(upload)
+            db.session.commit()
+            if pitch_mean_hz is not None and pitch_mean_hz > 0:
+                pitch_explanation = f"{pitch_mean_hz} Hz — {pitch_label}"
+            else:
+                pitch_explanation = "N/A — Pitch not detected (audio may be too quiet or unclear)"
 
-        # Generate actionable tips
-        analysis_metrics = {
-            "wpm": safe_float(wpm),
-            "filler_count": filler_count,
-            "pause_count": pause_count,
-            "pitch_variation_percent": safe_float(pitch_variation_percent),
-            "volume_std": safe_float(volume_std),
-            "noise_level": safe_float(noise_level),
-            "vocab_richness": safe_float(vocab_richness),
-            "advanced_vocab_count": advanced_vocab_count,
-            "sentence_var": safe_float(sentence_var)
-        }
-        actionable_tips = generate_actionable_tips(analysis_metrics)
+            set_job_progress(job_id, "generating_tips", 92)
 
-        # Get AI-powered advice (bonus)
-        ai_advice = get_ai_advice(transcript, analysis_metrics)
+            # Generate actionable tips
+            analysis_metrics = {
+                "wpm": safe_float(wpm),
+                "filler_count": filler_count,
+                "pause_count": pause_count,
+                "pitch_variation_percent": safe_float(pitch_variation_percent),
+                "volume_std": safe_float(volume_std),
+                "noise_level": safe_float(noise_level),
+                "vocab_richness": safe_float(vocab_richness),
+                "advanced_vocab_count": advanced_vocab_count,
+                "sentence_var": safe_float(sentence_var)
+            }
+            actionable_tips = generate_actionable_tips(analysis_metrics)
 
-        return jsonify({
-            "transcript": transcript,
-            "total_words": total_words,
-            "filler_count": filler_count,
-            "pause_count": pause_count,
-            "wpm": safe_float(wpm),
-            "pitch_std": safe_float(pitch_std),
-            "pitch_mean": safe_float(pitch_mean),
-            "pitch_mean_hz": pitch_mean_hz,
-            "pitch_mean_explained": pitch_explanation,
-            "pitch_variation_percent": safe_float(pitch_variation_percent),
-            "volume_mean": safe_float(volume_mean),
-            "volume_std": safe_float(volume_std),
-            "noise_level": safe_float(noise_level),
-            "vocab_richness": safe_float(vocab_richness),
-            "advanced_vocab_count": advanced_vocab_count,
-            "advanced_words": advanced_words,
-            "sentence_var": safe_float(sentence_var),
-            "score": score,
-            "actionable_tips": actionable_tips,
-            "ai_advice": ai_advice
-        })
-    except Exception as e:
-        print(f"Error processing upload: {str(e)}")
-        return jsonify({"error": "Audio processing failed. Please try a different or clearer audio file."}), 500
+            # Get AI-powered advice (bonus)
+            ai_advice = get_ai_advice(transcript, analysis_metrics)
+
+            result_payload = {
+                "transcript": transcript,
+                "total_words": total_words,
+                "filler_count": filler_count,
+                "pause_count": pause_count,
+                "wpm": safe_float(wpm),
+                "pitch_std": safe_float(pitch_std),
+                "pitch_mean": safe_float(pitch_mean),
+                "pitch_mean_hz": pitch_mean_hz,
+                "pitch_mean_explained": pitch_explanation,
+                "pitch_variation_percent": safe_float(pitch_variation_percent),
+                "volume_mean": safe_float(volume_mean),
+                "volume_std": safe_float(volume_std),
+                "noise_level": safe_float(noise_level),
+                "vocab_richness": safe_float(vocab_richness),
+                "advanced_vocab_count": advanced_vocab_count,
+                "advanced_words": advanced_words,
+                "sentence_var": safe_float(sentence_var),
+                "score": score,
+                "actionable_tips": actionable_tips,
+                "ai_advice": ai_advice
+            }
+            set_job_progress(job_id, "done", 100, result=result_payload)
+        except Exception as e:
+            print(f"Error processing upload: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            set_job_progress(job_id, "error", 0, error="Audio processing failed. Please try a different or clearer audio file.")
 
 # Find your get_uploads function and replace the return statement:
 
