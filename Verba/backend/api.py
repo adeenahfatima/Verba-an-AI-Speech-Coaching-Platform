@@ -2,7 +2,7 @@ import json
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-import whisper
+from faster_whisper import WhisperModel
 import nltk
 import os
 import gc
@@ -14,6 +14,7 @@ from scipy.ndimage import median_filter
 from pydub import AudioSegment
 import requests
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Download NLTK data only if not already present
 nltk.download('punkt', quiet=True)
@@ -35,7 +36,6 @@ CORS(app)  # Enable CORS for all routes
 
 # --- Database setup ---
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///verba.db')
-# Render gives postgres:// but SQLAlchemy needs postgresql://
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
@@ -80,7 +80,7 @@ class Upload(db.Model):
 
 # --- End database setup ---
 
-# Create tables on startup (runs whether started via gunicorn or `python api.py`)
+# Create tables on startup
 try:
     with app.app_context():
         db.create_all()
@@ -88,11 +88,12 @@ try:
 except Exception as e:
     print(f"Error during db.create_all(): {e}")
 
-model = whisper.load_model("tiny")  # Load once at startup
+# Load Whisper model once at startup
+from faster_whisper import WhisperModel
+whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
 
-# Cache the common-words set once at startup instead of rebuilding it
-# (and re-slicing 235k+ words) on every single upload request.
-COMMON_WORDS_SET = set(nltk.corpus.words.words()[:2000])
+# Cache the common-words set once at startup
+COMMON_WORDS_SET = set(nltk.corpus.words.words())
 
 def get_float(segment, key):
     value = segment.get(key, 0)
@@ -203,94 +204,133 @@ def generate_actionable_tips(metrics):
         else:
             tips.append("Good sentence variety. Keep it up!")
 
-    # Ensure at least one tip is always returned
     if not tips:
         tips.append("Great job on completing your speech! Keep practicing and you'll see even more improvement.")
     return tips
 
+
 def get_ai_advice(transcript, metrics):
     """
-    Call Hugging Face Inference API to get bonus AI-powered advice for the user's speech.
-    Always provide at least some advice, even if the AI returns nothing.
+    Call Gemini API to get AI-powered advice for the user's speech.
+    Falls back to rule-based advice if the API call fails.
     """
-    api_key = os.environ.get('HF_API_KEY')
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return None
-    model = "OpenAssistant/oasst-sft-4-pythia-12b-epoch-3.5"
-
+        print("GEMINI_API_KEY not set — skipping AI advice")
+        return _fallback_advice(metrics)
 
     # Identify weaknesses for the prompt
     weaknesses = []
     if metrics.get('wpm') is not None:
         if metrics['wpm'] < 110:
-            weaknesses.append("Your speaking pace is too slow.")
+            weaknesses.append("Speaking pace is too slow.")
         elif metrics['wpm'] > 160:
-            weaknesses.append("Your speaking pace is too fast.")
+            weaknesses.append("Speaking pace is too fast.")
     if metrics.get('filler_count', 0) > 5:
-        weaknesses.append("You use too many filler words.")
+        weaknesses.append("Too many filler words.")
     if metrics.get('pause_count', 0) > 5:
-        weaknesses.append("You have too many long pauses.")
+        weaknesses.append("Too many long pauses.")
     if metrics.get('pitch_variation_percent') is not None and metrics['pitch_variation_percent'] < 20:
-        weaknesses.append("Your pitch variation is low.")
+        weaknesses.append("Pitch variation is low.")
     if metrics.get('volume_std') is not None and metrics['volume_std'] < 0.01:
-        weaknesses.append("Your vocal energy is low.")
+        weaknesses.append("Vocal energy is low.")
     if metrics.get('noise_level') is not None and metrics['noise_level'] > 0.4:
-        weaknesses.append("Your background noise is high.")
+        weaknesses.append("Background noise is high.")
     if metrics.get('vocab_richness') is not None and metrics['vocab_richness'] < 0.2:
-        weaknesses.append("Your vocabulary range is limited.")
+        weaknesses.append("Vocabulary range is limited.")
     if metrics.get('advanced_vocab_count') is not None and metrics['advanced_vocab_count'] < 3:
-        weaknesses.append("You use few advanced words.")
+        weaknesses.append("Few advanced words used.")
     if metrics.get('sentence_var') is not None and metrics['sentence_var'] < 2:
-        weaknesses.append("Your sentence variety is low.")
+        weaknesses.append("Sentence variety is low.")
 
     weaknesses_str = "\n".join(weaknesses) if weaknesses else "No major weaknesses detected, but improvement is always possible."
 
     prompt = (
         "You are a public speaking coach. "
-        "Given the following speech transcript and analysis metrics, provide at least one personalized, encouraging, and actionable tip to help the speaker improve. "
+        "Given the following speech transcript and analysis metrics, provide at least one personalized, "
+        "encouraging, and actionable tip to help the speaker improve. "
         "Be specific and supportive. If weaknesses are listed, focus on them.\n"
-        f"Transcript: {transcript}\n"
+        f"Transcript (excerpt): {transcript[:1000]}\n"
         f"Metrics: {metrics}\n"
         f"Weaknesses: {weaknesses_str}\n"
-        "Advice:"
+        "Advice (2-3 sentences):"
     )
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+
+    # --- FIX: Correct Gemini API format ---
     payload = {
-        "inputs": prompt,
-        "parameters": {"max_new_tokens": 80}
+        "contents": [
+            {
+                "parts": [{"text": prompt}]
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 150,
+            "temperature": 0.7
+        }
     }
+
     try:
         response = requests.post(
-            f"https://api-inference.huggingface.co/models/{model}",
-            headers=headers,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+            headers={"Content-Type": "application/json"},
+            params={"key": api_key},
             json=payload,
             timeout=15
         )
+
         if response.status_code == 200:
             result = response.json()
-            if isinstance(result, list) and len(result) > 0 and 'generated_text' in result[0]:
-                advice = result[0]['generated_text'].strip()
-            elif isinstance(result, dict) and 'generated_text' in result:
-                advice = result['generated_text'].strip()
-            elif isinstance(result, list) and len(result) > 0 and 'generated_text' in result[-1]:
-                advice = result[-1]['generated_text'].strip()
-            elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], str):
-                advice = result[0].strip()
-            else:
-                advice = None
+            # Parse Gemini response structure
+            advice = (
+                result
+                .get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+            )
             if advice:
                 return advice
+            print("Gemini returned empty advice, using fallback.")
         else:
-            print(f"Hugging Face API error: {response.status_code} {response.text}")
+            print(f"Gemini API error: {response.status_code} — {response.text}")
+
     except Exception as e:
-        print(f"Error calling Hugging Face API: {e}")
-    # Fallback: rule-based advice if AI fails
+        print(f"Error calling Gemini API: {e}")
+
+    return _fallback_advice(metrics, weaknesses)
+
+
+def _fallback_advice(metrics, weaknesses=None):
+    """Rule-based fallback when Gemini is unavailable."""
     if weaknesses:
         return "Here are some areas to focus on: " + "; ".join(weaknesses)
-    return "Keep practicing! Even if you did well, there's always room for improvement."
+    return "Keep practicing! Even small improvements in pace, clarity, and vocabulary will make a big difference over time."
+
+
+# ---------------------------------------------------------------------------
+# Whisper chunk transcription — runs in a thread pool
+# ---------------------------------------------------------------------------
+
+def transcribe_chunk(args):
+    """Transcribe a single audio chunk. Designed to run in a ThreadPoolExecutor."""
+    idx, chunk, tmp_path = args
+    chunk_file = f"{tmp_path}_chunk_{idx}.wav"
+    try:
+        chunk.export(chunk_file, format="wav")
+        # faster-whisper returns (segments_generator, info)
+        segments_gen, _ = whisper_model.transcribe(chunk_file, beam_size=1, language="en")
+        segments = list(segments_gen)
+        text = " ".join(seg.text for seg in segments)
+        # Convert faster-whisper Segment objects to plain dicts for downstream use
+        seg_dicts = [{"start": seg.start, "end": seg.end, "text": seg.text} for seg in segments]
+        return idx, text, seg_dicts
+    finally:
+        try:
+            os.remove(chunk_file)
+        except OSError:
+            pass
+
 
 @app.route('/login.html')
 def serve_login():
@@ -320,8 +360,7 @@ def home():
 @app.route('/status', methods=['GET'])
 def status():
     try:
-        # Check if model is loaded
-        if model is not None:
+        if whisper_model is not None:
             return jsonify({'model_loaded': True, 'status': 'ready'})
         else:
             return jsonify({'model_loaded': False, 'status': 'loading'})
@@ -330,21 +369,16 @@ def status():
 
 @app.route('/transcribe', methods=['GET'])
 def transcribe():
-    """
-    Test route for transcription - this route is deprecated.
-    Use /transcribe_upload for proper file processing and database storage.
-    """
     return jsonify({
         "error": "This route is deprecated. Use /transcribe_upload for proper file processing.",
         "message": "Upload files through the frontend to get full analysis and database storage."
     }), 400
 
-# --- Background job tracking for progress polling ---
+
+# --- Background job tracking ---
 import uuid
 import threading
 
-# In-memory job store. Fine for single-worker (--workers 1) deployments;
-# if you ever scale to multiple workers, this needs to move to Redis/DB instead.
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -373,8 +407,6 @@ def transcribe_upload():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
 
-    # Save the upload synchronously (fast) so the file object isn't tied to
-    # this request thread before we hand off to the background worker.
     filename = file.filename.lower()
     orig_suffix = os.path.splitext(filename)[1] or '.bin'
     with tempfile.NamedTemporaryFile(delete=False, suffix=orig_suffix) as tmp_orig:
@@ -385,8 +417,6 @@ def transcribe_upload():
     with JOBS_LOCK:
         JOBS[job_id] = {"status": "queued", "percent": 0}
 
-    # Flask's request/app context doesn't carry into a raw thread automatically,
-    # so we capture app and pass the real filename in explicitly.
     thread = threading.Thread(
         target=process_audio_job,
         args=(job_id, orig_path, user_id, file.filename),
@@ -396,13 +426,13 @@ def transcribe_upload():
 
     return jsonify({"job_id": job_id}), 202
 
+
 def process_audio_job(job_id, orig_path, user_id, original_filename):
     with app.app_context():
         try:
             set_job_progress(job_id, "converting", 5)
-            # Convert to a real WAV file using pydub/ffmpeg, regardless of input format
-            # (browsers/devices send mp3, ogg/opus, m4a, aac, wma, webm, etc. — pydub
-            # auto-detects the real format from file content via ffmpeg, not extension)
+
+            # Convert to WAV using pydub/ffmpeg (handles mp3, ogg, m4a, webm, etc.)
             try:
                 audio_seg = AudioSegment.from_file(orig_path)
                 tmp_path = orig_path + '_converted.wav'
@@ -418,126 +448,158 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
                     pass
 
             print(f"Processing audio file: {original_filename} -> {tmp_path}")
+
+            # --- FIX: Actually skip pitch analysis for long audio ---
+            duration_seconds = len(audio_seg) / 1000
+            skip_pitch_analysis = duration_seconds > 600  # skip if >10 minutes
+
             set_job_progress(job_id, "analyzing_pitch", 20)
 
-            # --- Advanced Audio Metrics ---
             pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
             pitch_variation_percent = None
             pitch_mean_hz = None
             pitch_label = "Pitch not detected"
-            try:
-                import warnings
-                warnings.filterwarnings('ignore')
-                import parselmouth
-                snd = parselmouth.Sound(tmp_path)
-                Fs = snd.sampling_frequency
-                x = snd.values.T.flatten()
-                if len(x) == 0:
-                    print("Audio file is empty")
-                    raise ValueError("Empty audio file")
-                pitch = snd.to_pitch(time_step=0.01, pitch_floor=50.0, pitch_ceiling=500.0)
-                pitch_values = pitch.selected_array['frequency']
-                valid_pitch_values = pitch_values[
-                    (pitch_values > 0) &
-                    (pitch_values >= 50) &
-                    (pitch_values <= 500) &
-                    (~np.isnan(pitch_values)) &
-                    (~np.isinf(pitch_values))
-                ]
-                print(f"Total pitch frames: {len(pitch_values)}")
-                print(f"Valid pitch frames: {len(valid_pitch_values)}")
-                if len(valid_pitch_values) > 5:
-                    Q1 = np.percentile(valid_pitch_values, 10)
-                    Q3 = np.percentile(valid_pitch_values, 90)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - 2.0 * IQR
-                    upper_bound = Q3 + 2.0 * IQR
-                    filtered_pitch = valid_pitch_values[(valid_pitch_values >= lower_bound) & (valid_pitch_values <= upper_bound)]
-                    if len(filtered_pitch) < len(valid_pitch_values) * 0.2:
-                        low = np.percentile(valid_pitch_values, 5)
-                        high = np.percentile(valid_pitch_values, 95)
-                        filtered_pitch = valid_pitch_values[(valid_pitch_values >= low) & (valid_pitch_values <= high)]
-                    if len(filtered_pitch) > 0:
-                        pitch_mean = float(np.mean(filtered_pitch))
-                        pitch_std = float(np.std(filtered_pitch))
-                        pitch_mean_hz = round(pitch_mean)
-                        min_std = 2.0
-                        max_std = 20.0
-                        variation = np.clip((pitch_std - min_std) / (max_std - min_std), 0, 1)
-                        pitch_variation_percent = round(variation * 100)
-                        if pitch_mean < 85:
-                            pitch_label = "Very deep voice"
-                        elif pitch_mean < 110:
-                            pitch_label = "Deep voice"
-                        elif pitch_mean < 140:
-                            pitch_label = "Low-moderate voice"
-                        elif pitch_mean < 180:
-                            pitch_label = "Moderate voice"
-                        elif pitch_mean < 220:
-                            pitch_label = "Higher voice"
-                        elif pitch_mean < 300:
-                            pitch_label = "High voice"
+
+            if skip_pitch_analysis:
+                print(f"Audio is {duration_seconds:.0f}s — skipping pitch analysis for speed.")
+                pitch_label = "Pitch analysis skipped (audio too long)"
+            else:
+                try:
+                    import warnings
+                    warnings.filterwarnings('ignore')
+                    import parselmouth
+
+                    snd = parselmouth.Sound(tmp_path)
+                    Fs = snd.sampling_frequency
+                    x = snd.values.T.flatten()
+
+                    if len(x) == 0:
+                        raise ValueError("Empty audio file")
+
+                    pitch = snd.to_pitch(time_step=0.01, pitch_floor=50.0, pitch_ceiling=500.0)
+                    pitch_values = pitch.selected_array['frequency']
+                    valid_pitch_values = pitch_values[
+                        (pitch_values > 0) &
+                        (pitch_values >= 50) &
+                        (pitch_values <= 500) &
+                        (~np.isnan(pitch_values)) &
+                        (~np.isinf(pitch_values))
+                    ]
+
+                    print(f"Total pitch frames: {len(pitch_values)}")
+                    print(f"Valid pitch frames: {len(valid_pitch_values)}")
+
+                    if len(valid_pitch_values) > 5:
+                        Q1 = np.percentile(valid_pitch_values, 10)
+                        Q3 = np.percentile(valid_pitch_values, 90)
+                        IQR = Q3 - Q1
+                        lower_bound = Q1 - 2.0 * IQR
+                        upper_bound = Q3 + 2.0 * IQR
+                        filtered_pitch = valid_pitch_values[
+                            (valid_pitch_values >= lower_bound) & (valid_pitch_values <= upper_bound)
+                        ]
+                        if len(filtered_pitch) < len(valid_pitch_values) * 0.2:
+                            low = np.percentile(valid_pitch_values, 5)
+                            high = np.percentile(valid_pitch_values, 95)
+                            filtered_pitch = valid_pitch_values[
+                                (valid_pitch_values >= low) & (valid_pitch_values <= high)
+                            ]
+                        if len(filtered_pitch) > 0:
+                            pitch_mean = float(np.mean(filtered_pitch))
+                            pitch_std = float(np.std(filtered_pitch))
+                            pitch_mean_hz = round(pitch_mean)
+                            min_std = 2.0
+                            max_std = 20.0
+                            variation = np.clip((pitch_std - min_std) / (max_std - min_std), 0, 1)
+                            pitch_variation_percent = round(variation * 100)
+                            if pitch_mean < 85:
+                                pitch_label = "Very deep voice"
+                            elif pitch_mean < 110:
+                                pitch_label = "Deep voice"
+                            elif pitch_mean < 140:
+                                pitch_label = "Low-moderate voice"
+                            elif pitch_mean < 180:
+                                pitch_label = "Moderate voice"
+                            elif pitch_mean < 220:
+                                pitch_label = "Higher voice"
+                            elif pitch_mean < 300:
+                                pitch_label = "High voice"
+                            else:
+                                pitch_label = "Very high voice"
+                            print(f"Pitch: mean={pitch_mean:.2f}Hz, std={pitch_std:.2f}, variation={pitch_variation_percent}%, label={pitch_label}")
                         else:
-                            pitch_label = "Very high voice"
-                        print(f"Pitch analysis successful: mean={pitch_mean:.2f}Hz, std={pitch_std:.2f}, variation={pitch_variation_percent}%, label={pitch_label}")
+                            pitch_std = pitch_mean = 0.0
+                            pitch_variation_percent = 0
+                            pitch_mean_hz = 0
                     else:
-                        print("No valid pitch values after filtering")
-                        pitch_std = 0.0
-                        pitch_mean = 0.0
+                        print(f"Insufficient voiced segments: only {len(valid_pitch_values)} frames")
+                        pitch_std = pitch_mean = 0.0
                         pitch_variation_percent = 0
                         pitch_mean_hz = 0
-                else:
-                    print(f"Insufficient voiced segments: only {len(valid_pitch_values)} frames")
-                    pitch_std = 0.0
-                    pitch_mean = 0.0
-                    pitch_variation_percent = 0
-                    pitch_mean_hz = 0
-                frame_length = int(0.050 * Fs)
-                hop_length = int(0.025 * Fs)
-                if len(x) >= frame_length:
-                    frames = np.lib.stride_tricks.sliding_window_view(x, frame_length)[::hop_length]
-                    rms = np.sqrt(np.mean(frames**2, axis=1))
-                    valid_rms = rms[rms > 1e-10]
-                    if len(valid_rms) > 0:
-                        volume_mean = float(np.mean(valid_rms))
-                        volume_std = float(np.std(valid_rms))
-                        mean_rms = np.mean(valid_rms)
-                        threshold = 0.1 * mean_rms
-                        low_energy_ratio = np.sum(valid_rms < threshold) / len(valid_rms)
-                        noise_level = float(low_energy_ratio)
+
+                    # Volume / noise analysis
+                    frame_length = int(0.050 * Fs)
+                    hop_length = int(0.025 * Fs)
+                    if len(x) >= frame_length:
+                        frames = np.lib.stride_tricks.sliding_window_view(x, frame_length)[::hop_length]
+                        rms = np.sqrt(np.mean(frames**2, axis=1))
+                        valid_rms = rms[rms > 1e-10]
+                        if len(valid_rms) > 0:
+                            volume_mean = float(np.mean(valid_rms))
+                            volume_std = float(np.std(valid_rms))
+                            threshold = 0.1 * np.mean(valid_rms)
+                            noise_level = float(np.sum(valid_rms < threshold) / len(valid_rms))
+                        else:
+                            volume_mean = volume_std = noise_level = None
                     else:
                         volume_mean = volume_std = noise_level = None
-                else:
-                    volume_mean = volume_std = noise_level = None
-            except ImportError:
-                print("parselmouth not installed. Please install with: pip install praat-parselmouth")
-                set_job_progress(job_id, "error", 0, error="Speech analysis library not available. Please contact support.")
-                return
-            except Exception as audio_err:
-                import traceback
-                traceback.print_exc()
-                pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
-                pitch_variation_percent = None
-                pitch_mean_hz = None
-                pitch_label = "Pitch not detected"
 
-            # Free parselmouth/numpy memory before the heavier Whisper transcription step
-            try:
-                del snd, x
-            except NameError:
-                pass
+                    try:
+                        del snd, x
+                    except NameError:
+                        pass
+
+                except ImportError:
+                    print("parselmouth not installed.")
+                    set_job_progress(job_id, "error", 0, error="Speech analysis library not available. Please contact support.")
+                    return
+                except Exception as audio_err:
+                    import traceback
+                    traceback.print_exc()
+                    pitch_std = pitch_mean = volume_mean = volume_std = noise_level = None
+                    pitch_variation_percent = None
+                    pitch_mean_hz = None
+                    pitch_label = "Pitch not detected"
+
             gc.collect()
-
             set_job_progress(job_id, "transcribing", 45)
 
-            # --- Whisper Transcription ---
-            result = model.transcribe(tmp_path, fp16=False)
-            transcript = result['text']
-            if isinstance(transcript, list):
-                transcript = " ".join(transcript)
-            segments = result['segments']
-            del result
-            # Clean up the temp WAV file now — nothing downstream needs the audio anymore
+            # --- FIX: Parallel chunk transcription ---
+            audio = AudioSegment.from_wav(tmp_path)
+            chunk_ms = 10 * 60 * 1000  # 10-minute chunks (reduced I/O vs 5-min)
+            chunks = [audio[i:i + chunk_ms] for i in range(0, len(audio), chunk_ms)]
+
+            chunks_args = [(idx, chunk, tmp_path) for idx, chunk in enumerate(chunks)]
+            results = {}
+
+            # Use up to 3 parallel workers; more than that risks memory pressure on small VMs
+            max_workers = min(3, len(chunks))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(transcribe_chunk, arg): arg[0] for arg in chunks_args}
+                for future in as_completed(futures):
+                    idx, text, segs = future.result()
+                    results[idx] = (text, segs)
+                    # Update progress proportionally between 45% → 75%
+                    pct = 45 + int((len(results) / len(chunks)) * 30)
+                    set_job_progress(job_id, "transcribing", pct)
+
+            # Reassemble in chunk order
+            full_text = " ".join(results[i][0] for i in sorted(results))
+            all_segments = [seg for i in sorted(results) for seg in results[i][1]]
+
+            transcript = full_text.strip()
+            segments = all_segments
+
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -546,31 +608,35 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
 
             set_job_progress(job_id, "scoring", 80)
 
+            # --- Text analysis ---
             filler_words = ["um", "uh", "like", "you know"]
             words = nltk.word_tokenize(transcript.lower())
             total_words = len(words)
             filler_count = sum(words.count(filler) for filler in filler_words)
+
             pause_count = 0
             for i in range(1, len(segments)):
-                gap = get_float(segments[i], 'start') - get_float(segments[i-1], 'end')
+                gap = float(segments[i].get('end', 0)) - float(segments[i - 1].get('end', 0))
                 if gap > 2:
                     pause_count += 1
-            duration = get_float(segments[-1], 'end') if segments else 1.0
+
+            duration = float(segments[-1].get('end', 1)) if segments else 1.0
             wpm = (total_words / duration) * 60 if duration > 0 else 0
+
             vocab_richness = advanced_vocab_count = sentence_var = None
             advanced_words = []
             try:
                 unique_words = set(words)
                 vocab_richness = len(unique_words) / total_words if total_words > 0 else None
-                common_words = COMMON_WORDS_SET
-                advanced_words = [w for w in unique_words if w.isalpha() and w not in common_words]
+                advanced_words = [w for w in unique_words if w.isalpha() and w not in COMMON_WORDS_SET]
                 advanced_vocab_count = len(advanced_words)
                 sentences = nltk.sent_tokenize(transcript)
                 sentence_lengths = [len(nltk.word_tokenize(s)) for s in sentences]
                 sentence_var = float(np.std(sentence_lengths)) if len(sentence_lengths) > 1 else None
             except Exception as text_err:
                 print(f"Transcript analysis error: {text_err}")
-                vocab_richness = advanced_vocab_count = sentence_var = None
+
+            # --- Scoring ---
             score = 0
             try:
                 if 110 <= wpm <= 160:
@@ -625,8 +691,15 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
             except Exception as score_err:
                 print(f"Score calculation error: {score_err}")
                 score = 0
-            print(f"Analysis complete: {total_words} words, {filler_count} fillers, {pause_count} pauses, {wpm:.2f} wpm, pitch std: {pitch_std}, volume std: {volume_std}, noise: {noise_level}, vocab richness: {vocab_richness}, advanced vocab: {advanced_vocab_count}, sentence var: {sentence_var}, score: {score}")
 
+            print(
+                f"Analysis complete: {total_words} words, {filler_count} fillers, "
+                f"{pause_count} pauses, {wpm:.2f} wpm, pitch_std={pitch_std}, "
+                f"vol_std={volume_std}, noise={noise_level}, vocab={vocab_richness}, "
+                f"adv_vocab={advanced_vocab_count}, sent_var={sentence_var}, score={score}"
+            )
+
+            # --- Save to DB ---
             upload = Upload(
                 user_id=user_id,
                 filename=original_filename,
@@ -651,6 +724,7 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
             )
             db.session.add(upload)
             db.session.commit()
+
             if pitch_mean_hz is not None and pitch_mean_hz > 0:
                 pitch_explanation = f"{pitch_mean_hz} Hz — {pitch_label}"
             else:
@@ -658,7 +732,6 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
 
             set_job_progress(job_id, "generating_tips", 92)
 
-            # Generate actionable tips
             analysis_metrics = {
                 "wpm": safe_float(wpm),
                 "filler_count": filler_count,
@@ -671,8 +744,6 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
                 "sentence_var": safe_float(sentence_var)
             }
             actionable_tips = generate_actionable_tips(analysis_metrics)
-
-            # Get AI-powered advice (bonus)
             ai_advice = get_ai_advice(transcript, analysis_metrics)
 
             result_payload = {
@@ -698,13 +769,13 @@ def process_audio_job(job_id, orig_path, user_id, original_filename):
                 "ai_advice": ai_advice
             }
             set_job_progress(job_id, "done", 100, result=result_payload)
+
         except Exception as e:
             print(f"Error processing upload: {str(e)}")
             import traceback
             traceback.print_exc()
             set_job_progress(job_id, "error", 0, error="Audio processing failed. Please try a different or clearer audio file.")
 
-# Find your get_uploads function and replace the return statement:
 
 @app.route('/api/uploads/<int:user_id>', methods=['GET'])
 @app.route('/uploads/<int:user_id>', methods=['GET'])
@@ -721,10 +792,14 @@ def get_uploads(user_id):
             'wpm': u.wpm,
             'pitch_std': u.pitch_std,
             'pitch_mean': u.pitch_mean,
-            'pitch_mean_hz': u.pitch_mean_hz,  # ADD THIS LINE
-            'pitch_label': u.pitch_label,      # ADD THIS LINE
-            'pitch_variation_percent': u.pitch_variation_percent,  # ADD THIS LINE
-            'pitch_mean_explained': f"{u.pitch_mean_hz} Hz — {u.pitch_label}" if u.pitch_mean_hz and u.pitch_mean_hz > 0 else "N/A — Pitch not detected",  # ADD THIS LINE
+            'pitch_mean_hz': u.pitch_mean_hz,
+            'pitch_label': u.pitch_label,
+            'pitch_variation_percent': u.pitch_variation_percent,
+            'pitch_mean_explained': (
+                f"{u.pitch_mean_hz} Hz — {u.pitch_label}"
+                if u.pitch_mean_hz and u.pitch_mean_hz > 0
+                else "N/A — Pitch not detected"
+            ),
             'volume_mean': u.volume_mean,
             'volume_std': u.volume_std,
             'noise_level': u.noise_level,
@@ -733,9 +808,10 @@ def get_uploads(user_id):
             'sentence_var': u.sentence_var,
             'score': u.score,
             'timestamp': u.timestamp.isoformat() if u.timestamp else None,
-            'advanced_words': json.loads(u.advanced_words) if u.advanced_words else []  # ADD THIS LINE
+            'advanced_words': json.loads(u.advanced_words) if u.advanced_words else []
         } for u in uploads
     ])
+
 
 @app.route('/api/profile/<int:user_id>', methods=['GET'])
 @app.route('/profile/<int:user_id>', methods=['GET'])
@@ -751,6 +827,7 @@ def get_profile(user_id):
         'lowest_filler': lowest_filler,
         'longest_speech': longest_speech
     })
+
 
 @app.route('/api/register', methods=['POST'])
 @app.route('/register', methods=['POST'])
@@ -769,6 +846,7 @@ def register():
     db.session.commit()
     return jsonify({'message': 'User registered successfully'})
 
+
 @app.route('/api/login', methods=['POST'])
 @app.route('/login', methods=['POST'])
 def login():
@@ -777,10 +855,16 @@ def login():
     password = data.get('password')
     if not username_or_email or not password:
         return jsonify({'error': 'Missing required fields'}), 400
-    user = User.query.filter((User.username == username_or_email) | (User.email == username_or_email)).first()
+    user = User.query.filter(
+        (User.username == username_or_email) | (User.email == username_or_email)
+    ).first()
     if not user or not bcrypt.check_password_hash(user.password_hash, password):
         return jsonify({'error': 'Invalid username/email or password'}), 401
-    return jsonify({'message': 'Login successful', 'user': {'id': user.id, 'username': user.username, 'email': user.email}})
+    return jsonify({
+        'message': 'Login successful',
+        'user': {'id': user.id, 'username': user.username, 'email': user.email}
+    })
+
 
 if __name__ == '__main__':
     print("Flask app loaded")
