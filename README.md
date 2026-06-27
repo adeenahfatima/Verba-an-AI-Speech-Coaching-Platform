@@ -1,6 +1,6 @@
 # VERBA — AI Speech Coaching Platform
 
-VERBA is a web app that analyzes recorded or uploaded speech and gives feedback on
+VERBA is a web app that analyzes recorded speech and gives feedback on
 clarity, pace, pitch, filler words, and vocabulary. It transcribes audio with
 OpenAI Whisper and runs acoustic analysis with librosa and Praat (parselmouth).
 
@@ -201,6 +201,6 @@ Check it out: verbaprod-production.up.railway.app
 
 - AI-generated tips (`ai_advice` field) require a HuggingFace API key (`HF_API_KEY`).
   Without it, the app falls back to rule-based tips automatically.
-- Free-tier hosting (Railway/Render) has limited CPU — expect slower processing for longer audio files compared to local development on a capable machine.
+- Free-tier hosting (Railway/Render) has limited CPU so expect slower processing for longer audio files compared to local development on a capable machine.
 
 ---
